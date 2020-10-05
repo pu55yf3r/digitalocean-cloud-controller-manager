@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## Unreleased
+
+* Support LB custom size slug (@anitgandhi)
+
 ## v0.1.27 (beta) - September 24th 2020
 
 * Support HTTPS as health check protocol (@timoreimann)
