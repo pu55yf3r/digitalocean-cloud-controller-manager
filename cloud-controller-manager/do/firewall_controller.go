@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/digitalocean/godo"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -43,8 +45,12 @@ const (
 	serviceSyncPeriod = 30 * time.Second
 	// Frequency at which the firewall controller runs.
 	firewallReconcileFrequency = 5 * time.Minute
-	originEvent                = "event"
-	originFirewallLoop         = "firewall_loop"
+	// Timeout value for processing worker items taken from the queue.
+	processWorkerItemTimeout = 30 * time.Second
+	originEvent              = "event"
+	originFirewallLoop       = "firewall_loop"
+
+	queueKey = "service"
 
 	// How long to wait before retrying the processing of a firewall change.
 	minRetryDelay = 1 * time.Second
@@ -127,13 +133,13 @@ func NewFirewallController(
 	serviceInformer.Informer().AddEventHandlerWithResyncPeriod(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(cur interface{}) {
-				fc.queue.Add("service")
+				fc.queue.Add(queueKey)
 			},
 			UpdateFunc: func(old, cur interface{}) {
-				fc.queue.Add("service")
+				fc.queue.Add(queueKey)
 			},
 			DeleteFunc: func(cur interface{}) {
-				fc.queue.Add("service")
+				fc.queue.Add(queueKey)
 			},
 		},
 		serviceSyncPeriod,
@@ -160,8 +166,6 @@ func (fc *FirewallController) runWorker() {
 }
 
 func (fc *FirewallController) processNextItem() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), firewallReconcileFrequency)
-	defer cancel()
 	// Wait until there is a new item in the working queue
 	key, quit := fc.queue.Get()
 	if quit {
@@ -172,9 +176,11 @@ func (fc *FirewallController) processNextItem() bool {
 	// parallel.
 	defer fc.queue.Done(key)
 
+	ctx, cancel := context.WithTimeout(context.Background(), processWorkerItemTimeout)
+	defer cancel()
 	err := fc.observeReconcileDuration(ctx, originEvent)
 	if err != nil {
-		klog.Errorf("failed to run firewall controller loop: %v", err)
+		klog.Errorf("failed to process worker item: %v", err)
 		fc.queue.AddRateLimited(key)
 	}
 	fc.queue.Forget(key)
@@ -286,12 +292,13 @@ func (fm *firewallManager) Set(ctx context.Context, fr *godo.FirewallRequest) er
 	targetFirewall := fm.fwCache.getCachedFirewall()
 
 	if targetFirewall != nil {
-		equal, unequalParts := isEqual(targetFirewall, fr)
-		if equal {
+		diff := firewallDiff(targetFirewall, fr)
+		if diff == "" {
 			// A locally cached firewall with matching rules, correct name and tags means there is nothing to update.
 			return nil
 		}
-		klog.Infof("firewall configuration mismatch: %v", unequalParts)
+		klog.Infof("firewall configuration mismatch on parts (diffs: %s)", diff)
+		// klog.Infof("firewall configuration mismatch on parts (diff:\ncurrent: %s\ntarget:  %s)", printRelevantFirewallRequestParts(fr), printRelevantFirewallParts(targetFirewall))
 
 		// A locally cached firewall exists, but is does not match the expected
 		// service inbound rules, outbound rules, name or tags. So we need to use the locally
@@ -363,19 +370,90 @@ func (fm *firewallManager) Set(ctx context.Context, fr *godo.FirewallRequest) er
 	return nil
 }
 
-func isEqual(targetFirewall *godo.Firewall, fr *godo.FirewallRequest) (bool, []string) {
+func firewallDiff(targetFirewall *godo.Firewall, fr *godo.FirewallRequest) string {
+	type firewallCompare struct {
+		Name          string
+		InboundRules  []godo.InboundRule
+		OutboundRules []godo.OutboundRule
+		Tags          []string
+	}
+
+	fwComp1 := firewallCompare{
+		Name:          targetFirewall.Name,
+		InboundRules:  targetFirewall.InboundRules,
+		OutboundRules: targetFirewall.OutboundRules,
+		Tags:          targetFirewall.Tags,
+	}
+	fwComp2 := firewallCompare{
+		Name:          fr.Name,
+		InboundRules:  fr.InboundRules,
+		OutboundRules: fr.OutboundRules,
+		Tags:          fr.Tags,
+	}
+
+	sorter := cmpopts.SortSlices(func(r1, r2 godo.OutboundRule) bool {
+		return printOutboundRule(r1) < printOutboundRule(r2)
+	})
+
+	portRangeFilter := cmp.FilterPath(func(p cmp.Path) bool {
+		switch p.String() {
+		case "InboundRules.PortRange", "OutboundRules.PortRange":
+			return true
+		}
+		return false
+	}, cmp.Comparer(func(pr1, pr2 string) bool {
+		if pr1 == "" || pr1 == "0" || pr1 == "all" {
+			pr1 = "0"
+		}
+		if pr2 == "" || pr2 == "0" || pr2 == "all" {
+			pr2 = "0"
+		}
+
+		return pr1 == pr2
+	}))
+
+	ruleDetailsFilter := cmp.FilterPath(func(p cmp.Path) bool {
+		if strings.HasPrefix(p.String(), "InboundRules.Sources") || strings.HasPrefix(p.String(), "OutboundRules.Destinations") {
+			return p.Last().String() != ".Addresses"
+		}
+
+		return false
+	}, cmp.Ignore())
+
+	return cmp.Diff(fwComp1, fwComp2, sorter, portRangeFilter, ruleDetailsFilter)
+}
+
+func isDiff(targetFirewall *godo.Firewall, fr *godo.FirewallRequest) (bool, []string) {
 	var unequalParts []string
 	if targetFirewall.Name != fr.Name {
 		unequalParts = append(unequalParts, "name")
 	}
-	if !cmp.Equal(targetFirewall.InboundRules, fr.InboundRules) {
-		unequalParts = append(unequalParts, "inboundRules")
+	if diff := cmp.Diff(targetFirewall.InboundRules, fr.InboundRules,
+		cmp.Transformer("inboundrule", func(r godo.InboundRule) string {
+			return printInboundRule(r)
+		}),
+		cmpopts.SortSlices(func(r1, r2 string) bool {
+			return r1 < r2
+		}),
+	); diff != "" {
+		unequalParts = append(unequalParts, diff)
 	}
-	if !cmp.Equal(targetFirewall.OutboundRules, fr.OutboundRules) {
-		unequalParts = append(unequalParts, "outboundRules")
+	if diff := cmp.Diff(targetFirewall.OutboundRules, fr.OutboundRules,
+		cmp.Transformer("outboundrule", func(r godo.OutboundRule) string {
+			transformed := printOutboundRule(r)
+			klog.Infof("=========== transformed outbound rule: %s", transformed)
+			return transformed
+		}),
+		cmpopts.SortSlices(func(r1, r2 string) bool {
+			return r1 < r2
+		}),
+	); diff != "" {
+		unequalParts = append(unequalParts, diff)
 	}
-	if !cmp.Equal(targetFirewall.Tags, fr.Tags) {
-		unequalParts = append(unequalParts, "tags")
+	if diff := cmp.Diff(targetFirewall.Tags, fr.Tags, cmpopts.SortSlices(func(t1, t2 string) bool {
+		return t1 < t2
+	})); diff != "" {
+		unequalParts = append(unequalParts, diff)
 	}
 	return len(unequalParts) == 0, unequalParts
 }

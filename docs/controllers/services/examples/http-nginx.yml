@@ -6,7 +6,7 @@ metadata:
   annotations:
     service.beta.kubernetes.io/do-loadbalancer-protocol: "http"
 spec:
-  type: LoadBalancer
+  type: NodePort
   selector:
     app: nginx-example
   ports:
