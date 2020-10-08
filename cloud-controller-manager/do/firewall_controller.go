@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,16 +42,13 @@ import (
 )
 
 const (
-	// Interval of synchronizing service status from apiserver.
-	serviceSyncPeriod = 30 * time.Second
 	// Frequency at which the firewall controller runs.
-	firewallReconcileFrequency = 5 * time.Minute
+	firewallReconcileFrequency = 5 * time.Second
 	// Timeout value for processing worker items taken from the queue.
 	processWorkerItemTimeout = 30 * time.Second
 	originEvent              = "event"
 	originFirewallLoop       = "firewall_loop"
-
-	queueKey = "service"
+	queueKey                 = "service"
 
 	// How long to wait before retrying the processing of a firewall change.
 	minRetryDelay = 1 * time.Second
@@ -142,7 +140,7 @@ func NewFirewallController(
 				fc.queue.Add(queueKey)
 			},
 		},
-		serviceSyncPeriod,
+		0,
 	)
 	fc.serviceLister = serviceInformer.Lister()
 
@@ -151,12 +149,19 @@ func NewFirewallController(
 
 // Run starts the firewall controller loop.
 func (fc *FirewallController) Run(ctx context.Context, stopCh <-chan struct{}, fwReconcileFrequency time.Duration) {
-	wait.Until(func() {
-		err := fc.observeRunLoopDuration(ctx)
-		if err != nil {
-			klog.Errorf("failed to run firewall controller loop: %v", err)
+	// Use PollUntil instead of Until to wait one fwReconcileFrequency interval
+	// before syncing the cloud firewall: when the firewall controller starts
+	// up, the event handler is triggered as the cache gets populated and runs
+	// through all services already. There is no need to for us to do so again
+	// from here.
+	wait.PollUntil(fwReconcileFrequency, func() (done bool, err error) {
+		klog.V(5).Info("running cloud firewall sync loop")
+		runErr := fc.observeRunLoopDuration(ctx)
+		if runErr != nil && ctx.Err() == nil {
+			klog.Errorf("failed to run firewall reconcile loop: %v", runErr)
 		}
-	}, fwReconcileFrequency, stopCh)
+		return false, nil
+	}, stopCh)
 	fc.queue.ShutDown()
 }
 
@@ -198,12 +203,9 @@ func (fc *FirewallController) reconcileCloudFirewallChanges(ctx context.Context)
 		}
 	}
 	fc.fwManager.fwCache.updateCache(currentFirewall)
-	err = fc.observeReconcileDuration(ctx, originFirewallLoop)
-	if err != nil {
-		return fmt.Errorf("failed to reconcile worker firewall: %s", err)
-	}
+	klog.Info("issuing firewall reconcile")
+	fc.queue.Add(queueKey)
 
-	klog.Info("successfully reconciled firewall")
 	return nil
 }
 
@@ -253,7 +255,7 @@ func (fm *firewallManager) Get(ctx context.Context) (*godo.Firewall, error) {
 	f := func(fw godo.Firewall) bool {
 		return fw.Name == fm.workerFirewallName
 	}
-	klog.Info("filtering firewall list for the firewall that has the expected firewall name")
+	klog.Infof("filtering firewall list for firewall name %q", fm.workerFirewallName)
 	fw, err := func() (*godo.Firewall, error) {
 		var (
 			code   int
@@ -279,9 +281,9 @@ func (fm *firewallManager) Get(ctx context.Context) (*godo.Firewall, error) {
 		return nil, fmt.Errorf("failed to retrieve list of firewalls from DO API: %v", err)
 	}
 	if fw != nil {
-		klog.Info("found firewall by listing")
+		klog.Infof("found firewall %q by listing", fm.workerFirewallName)
 	} else {
-		klog.Info("could not find firewall by listing")
+		klog.Infof("could not find firewall %q by listing", fm.workerFirewallName)
 	}
 	return fw, nil
 }
@@ -295,6 +297,7 @@ func (fm *firewallManager) Set(ctx context.Context, fr *godo.FirewallRequest) er
 		diff := firewallDiff(targetFirewall, fr)
 		if diff == "" {
 			// A locally cached firewall with matching rules, correct name and tags means there is nothing to update.
+			klog.Info("skipping firewall update since it matches the cache")
 			return nil
 		}
 		klog.Infof("firewall configuration mismatch on parts (diffs: %s)", diff)
@@ -304,28 +307,7 @@ func (fm *firewallManager) Set(ctx context.Context, fr *godo.FirewallRequest) er
 		// service inbound rules, outbound rules, name or tags. So we need to use the locally
 		// cached firewall ID to attempt to update the firewall APIs representation of the
 		// firewall with the new rules
-		currentFirewall, resp, err := func() (*godo.Firewall, *godo.Response, error) {
-			var (
-				code   int
-				method string
-			)
-			// The ObserverFunc gets called by the deferred ObserveDuration. The
-			// method and code values will be set before ObserveDuration is called
-			// with the value returned from the response from the Firewall API request.
-			timer := prometheus.NewTimer(prometheus.ObserverFunc(func(v float64) {
-				fm.metrics.apiRequestDuration.With(prometheus.Labels{"method": method, "code": strconv.FormatInt(int64(code), 10)}).Observe(v)
-			}))
-			defer timer.ObserveDuration()
-			fw, resp, err := fm.client.Firewalls.Update(ctx, targetFirewall.ID, fr)
-			if resp != nil {
-				code = resp.StatusCode
-				if resp.Request != nil {
-					method = resp.Request.Method
-				}
-			}
-			return fw, resp, err
-		}()
-
+		currentFirewall, resp, err := fm.updateFirewall(ctx, targetFirewall.ID, fr)
 		if err == nil {
 			klog.Info("successfully updated firewall")
 		} else {
@@ -351,15 +333,15 @@ func (fm *firewallManager) Set(ctx context.Context, fr *godo.FirewallRequest) er
 			return fmt.Errorf("failed to check if firewall already exists: %s", err)
 		}
 		if currentFirewall == nil {
-			klog.Info("an existing firewall not found, we need to create one")
+			klog.Info("existing firewall not found, need to create one")
 			currentFirewall, err = fm.createFirewall(ctx, fr)
 			if err != nil {
 				return err
 			}
 			klog.Info("successfully created firewall")
 		} else {
-			klog.Info("an existing firewall is found, we need to update it")
-			currentFirewall, err = fm.updateFirewall(ctx, currentFirewall.ID, fr)
+			klog.Info("existing firewall found, need to update it")
+			currentFirewall, _, err = fm.updateFirewall(ctx, currentFirewall.ID, fr)
 			if err != nil {
 				return fmt.Errorf("could not update firewall: %v", err)
 			}
@@ -471,6 +453,7 @@ func (fm *firewallManager) createFirewall(ctx context.Context, fr *godo.Firewall
 	}))
 	defer timer.ObserveDuration()
 
+	klog.Infof("submitting firewall create request: %s", printRelevantFirewallRequestParts(fr))
 	currentFirewall, resp, err := fm.client.Firewalls.Create(ctx, fr)
 	if resp != nil {
 		code = resp.StatusCode
@@ -482,7 +465,7 @@ func (fm *firewallManager) createFirewall(ctx context.Context, fr *godo.Firewall
 	return currentFirewall, err
 }
 
-func (fm *firewallManager) updateFirewall(ctx context.Context, fwID string, fr *godo.FirewallRequest) (*godo.Firewall, error) {
+func (fm *firewallManager) updateFirewall(ctx context.Context, fwID string, fr *godo.FirewallRequest) (*godo.Firewall, *godo.Response, error) {
 	var (
 		code   int
 		method string
@@ -495,6 +478,7 @@ func (fm *firewallManager) updateFirewall(ctx context.Context, fwID string, fr *
 	}))
 	defer timer.ObserveDuration()
 
+	klog.Infof("submitting firewall update request: %s", printRelevantFirewallRequestParts(fr))
 	currentFirewall, resp, err := fm.client.Firewalls.Update(ctx, fwID, fr)
 	if resp != nil {
 		code = resp.StatusCode
@@ -503,7 +487,7 @@ func (fm *firewallManager) updateFirewall(ctx context.Context, fwID string, fr *
 		}
 	}
 
-	return currentFirewall, err
+	return currentFirewall, resp, err
 }
 
 // createReconciledFirewallRequest creates a firewall request that has the correct rules, name and tag
@@ -578,6 +562,7 @@ func (fc *firewallCache) updateCache(currentFirewall *godo.Firewall) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	fc.firewall = currentFirewall
+	klog.Infof("updated cached firewall to: %s", printRelevantFirewallParts(currentFirewall))
 }
 
 func (fc *FirewallController) observeReconcileDuration(ctx context.Context, origin string) error {
@@ -596,9 +581,74 @@ func (fc *FirewallController) observeRunLoopDuration(ctx context.Context) error 
 	defer t.ObserveDuration()
 
 	err := fc.reconcileCloudFirewallChanges(ctx)
-	if err == nil {
+	if err == nil || ctx.Err() != nil {
 		labels["success"] = "true"
 	}
 
 	return err
+}
+
+func printRelevantFirewallParts(fw *godo.Firewall) string {
+	return printFirewallParts(fw.Name, fw.InboundRules, fw.OutboundRules, fw.Tags)
+}
+
+func printRelevantFirewallRequestParts(fr *godo.FirewallRequest) string {
+	return printFirewallParts(fr.Name, fr.InboundRules, fr.OutboundRules, fr.Tags)
+}
+
+func printFirewallParts(name string, inboundRules []godo.InboundRule, outboundRules []godo.OutboundRule, tags []string) string {
+	parts := []string{fmt.Sprintf("Name:%s", name)}
+	parts = append(parts, fmt.Sprintf("inRules:{%s}", printInboundRules(inboundRules)))
+	parts = append(parts, fmt.Sprintf("outRules:{%s}", printOutboundRules(outboundRules)))
+	parts = append(parts, fmt.Sprintf("Tags:%s", tags))
+
+	return strings.Join(parts, " ")
+}
+
+func printInboundRules(inboundRules []godo.InboundRule) string {
+	inbRules := make([]string, 0, len(inboundRules))
+	for _, inbRule := range inboundRules {
+		inbRules = append(inbRules, printInboundRule(inbRule))
+	}
+	sort.Strings(inbRules)
+	return strings.Join(inbRules, " ")
+}
+
+func printInboundRule(inboundRule godo.InboundRule) string {
+	portRange := inboundRule.PortRange
+	if inboundRule.PortRange == "" || inboundRule.PortRange == "all" {
+		portRange = "0"
+	}
+	rule := fmt.Sprintf("<Proto:%s PortRange:%s", inboundRule.Protocol, portRange)
+
+	if inboundRule.Sources != nil {
+		rule += fmt.Sprintf(" AddrSources:%s", inboundRule.Sources.Addresses)
+	}
+
+	rule += ">"
+	return rule
+}
+
+func printOutboundRules(outboundRules []godo.OutboundRule) string {
+	outbRules := make([]string, 0, len(outboundRules))
+	for _, outbRule := range outboundRules {
+		outbRules = append(outbRules, printOutboundRule(outbRule))
+	}
+	sort.Strings(outbRules)
+	return strings.Join(outbRules, " ")
+}
+
+func printOutboundRule(outboundRule godo.OutboundRule) string {
+	portRange := outboundRule.PortRange
+	if outboundRule.PortRange == "" || outboundRule.PortRange == "all" {
+		portRange = "0"
+	}
+	rule := fmt.Sprintf("<Proto:%s PortRange:%s", outboundRule.Protocol, portRange)
+
+	if outboundRule.Destinations != nil {
+		rule += fmt.Sprintf(" AddrDestinations:%s", outboundRule.Destinations.Addresses)
+	}
+
+	rule += ">"
+	return rule
 }
