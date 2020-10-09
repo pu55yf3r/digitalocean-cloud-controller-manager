@@ -75,7 +75,7 @@ func compFirewallsEqual(cf1, cf2 *comparableFirewall) (bool, string) {
 		return sanitizePortRange(pr1) == sanitizePortRange(pr2)
 	}))
 
-	ruleDetailsFilter := cmp.FilterPath(func(p cmp.Path) bool {
+	ruleSourceDestFilter := cmp.FilterPath(func(p cmp.Path) bool {
 		if strings.HasPrefix(p.String(), "InboundRules.Sources") || strings.HasPrefix(p.String(), "OutboundRules.Destinations") {
 			return p.Last().String() != ".Addresses"
 		}
@@ -83,7 +83,7 @@ func compFirewallsEqual(cf1, cf2 *comparableFirewall) (bool, string) {
 		return false
 	}, cmp.Ignore())
 
-	diff := cmp.Diff(cf1, cf2, sorter, portRangeFilter, ruleDetailsFilter)
+	diff := cmp.Diff(cf1, cf2, sorter, portRangeFilter, ruleSourceDestFilter)
 	return diff == "", diff
 }
 

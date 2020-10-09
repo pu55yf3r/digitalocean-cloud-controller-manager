@@ -94,7 +94,7 @@ func (fc *firewallCache) updateCache(currentFirewall *godo.Firewall) {
 		klog.V(5).Infof("updated firewall cache to: %s", printRelevantFirewallParts(currentFirewall))
 		fc.firewall = currentFirewall
 	} else {
-		klog.V(8).Infof("not updating firewall cache which already contains: %s", printRelevantFirewallParts(currentFirewall))
+		klog.V(6).Infof("not updating firewall cache which already contains: %s", printRelevantFirewallParts(currentFirewall))
 	}
 	fc.Unlock()
 }
@@ -168,7 +168,7 @@ func (fc *FirewallController) Run(ctx context.Context, stopCh <-chan struct{}, f
 	// through all services already. There is no need to for us to do so again
 	// from here.
 	wait.PollUntil(fwReconcileFrequency, func() (done bool, err error) {
-		klog.V(5).Info("running cloud firewall sync loop")
+		klog.V(6).Info("running cloud firewall sync loop")
 		runErr := fc.observeRunLoopDuration(ctx)
 		if runErr != nil && ctx.Err() == nil {
 			klog.Errorf("failed to run firewall reconcile loop: %v", runErr)
@@ -225,7 +225,8 @@ func (fm *firewallManager) Get(ctx context.Context) (fw *godo.Firewall, err erro
 		}
 	}()
 
-	// check cache and query the API firewall service to get firewall by ID, if it exists. Return it. If not, continue.
+	// check cache and query the API firewall service to get firewall by ID, if
+	// it exists. Return it. If not, continue.
 	fw, _ = fm.fwCache.getCachedFirewall()
 	if fw != nil {
 		var (
@@ -269,7 +270,7 @@ func (fm *firewallManager) Get(ctx context.Context) (fw *godo.Firewall, err erro
 	f := func(fw godo.Firewall) bool {
 		return fw.Name == fm.workerFirewallName
 	}
-	klog.Infof("filtering firewall list for firewall name %q", fm.workerFirewallName)
+	klog.V(6).Infof("filtering firewall list for firewall name %q", fm.workerFirewallName)
 	fw, err = func() (*godo.Firewall, error) {
 		var (
 			code   int
@@ -295,9 +296,9 @@ func (fm *firewallManager) Get(ctx context.Context) (fw *godo.Firewall, err erro
 		return nil, fmt.Errorf("failed to retrieve list of firewalls from DO API: %v", err)
 	}
 	if fw != nil {
-		klog.Infof("found firewall %q by listing", fm.workerFirewallName)
+		klog.V(6).Infof("found firewall %q by listing", fm.workerFirewallName)
 	} else {
-		klog.Infof("could not find firewall %q by listing", fm.workerFirewallName)
+		klog.V(6).Infof("could not find firewall %q by listing", fm.workerFirewallName)
 	}
 	return fw, nil
 }
@@ -323,7 +324,7 @@ func (fm *firewallManager) Set(ctx context.Context, fwID string, fr *godo.Firewa
 			return nil
 		}
 		if resp == nil || resp.StatusCode != http.StatusNotFound {
-			return fmt.Errorf("could not update firewall: %v", err)
+			return fmt.Errorf("failed to update firewall: %v", err)
 		}
 	}
 
@@ -333,7 +334,7 @@ func (fm *firewallManager) Set(ctx context.Context, fwID string, fr *godo.Firewa
 	// it.
 	currentFirewall, err = fm.createFirewall(ctx, fr)
 	if err != nil {
-		return fmt.Errorf("could not create firewall: %v", err)
+		return fmt.Errorf("failed to create firewall: %v", err)
 	}
 	klog.Info("successfully created firewall")
 	return nil
@@ -444,7 +445,7 @@ func (fc *FirewallController) ensureReconciledFirewall(ctx context.Context) (ski
 
 	isEqual, diff := firewallRequestEqual(fw, fr)
 	if isEqual {
-		klog.V(5).Info("skipping firewall reconcile because target and cached firewall match")
+		klog.V(6).Info("skipping firewall reconcile because target and cached firewall match")
 		return true, nil
 	}
 
@@ -506,13 +507,13 @@ func (fc *FirewallController) observeRunLoopDuration(ctx context.Context) error 
 	if err != nil {
 		labels["result"] = "failed"
 		if ctx.Err() != nil {
-			labels["result"] = "aborted"
+			labels["result"] = "canceled"
 		}
 
 		return err
 	}
 
-	klog.V(5).Info("issuing firewall reconcile")
+	klog.V(6).Info("issuing firewall reconcile")
 	fc.queue.Add(queueKey)
 	return nil
 }
