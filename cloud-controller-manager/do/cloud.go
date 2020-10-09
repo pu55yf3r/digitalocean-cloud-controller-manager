@@ -186,7 +186,7 @@ func (c *cloud) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, 
 	fm := firewallManager{
 		client: c.client,
 		fwCache: firewallCache{
-			mu: new(sync.RWMutex),
+			RWMutex: new(sync.RWMutex),
 		},
 		workerFirewallName: c.resources.firewall.name,
 		workerFirewallTags: c.resources.firewall.tags,

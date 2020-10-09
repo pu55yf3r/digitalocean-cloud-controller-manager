@@ -20,15 +20,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/digitalocean/godo"
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -46,8 +42,6 @@ const (
 	firewallReconcileFrequency = 5 * time.Second
 	// Timeout value for processing worker items taken from the queue.
 	processWorkerItemTimeout = 30 * time.Second
-	originEvent              = "event"
-	originFirewallLoop       = "firewall_loop"
 	queueKey                 = "service"
 
 	// How long to wait before retrying the processing of a firewall change.
@@ -82,8 +76,27 @@ var (
 
 // firewallCache stores a cached firewall and mutex to handle concurrent access.
 type firewallCache struct {
-	mu       *sync.RWMutex // protects firewall.
+	*sync.RWMutex
 	firewall *godo.Firewall
+	isSet    bool
+}
+
+func (fc *firewallCache) getCachedFirewall() (*godo.Firewall, bool) {
+	fc.RLock()
+	defer fc.RUnlock()
+	return fc.firewall, fc.isSet
+}
+
+func (fc *firewallCache) updateCache(currentFirewall *godo.Firewall) {
+	fc.Lock()
+	fc.isSet = true
+	if isEqual, _ := firewallsEqual(fc.firewall, currentFirewall); !isEqual {
+		klog.V(5).Infof("updated firewall cache to: %s", printRelevantFirewallParts(currentFirewall))
+		fc.firewall = currentFirewall
+	} else {
+		klog.V(8).Infof("not updating firewall cache which already contains: %s", printRelevantFirewallParts(currentFirewall))
+	}
+	fc.Unlock()
 }
 
 // firewallManager manages the interaction with the DO Firewalls API.
@@ -176,14 +189,14 @@ func (fc *FirewallController) processNextItem() bool {
 	if quit {
 		return false
 	}
-	// Tell the queue that we are done with processing this key. This unblocks the key for other workers
-	// This allows safe parallel processing because items with the same key are never processed in
-	// parallel.
+	// Tell the queue that we are done with processing this key to unblock the
+	// key for other workers. This allows safe parallel processing because items
+	// with the same key are never processed in parallel.
 	defer fc.queue.Done(key)
 
 	ctx, cancel := context.WithTimeout(context.Background(), processWorkerItemTimeout)
 	defer cancel()
-	err := fc.observeReconcileDuration(ctx, originEvent)
+	err := fc.observeReconcileDuration(ctx)
 	if err != nil {
 		klog.Errorf("failed to process worker item: %v", err)
 		fc.queue.AddRateLimited(key)
@@ -192,27 +205,28 @@ func (fc *FirewallController) processNextItem() bool {
 	return true
 }
 
-func (fc *FirewallController) reconcileCloudFirewallChanges(ctx context.Context) error {
-	currentFirewall, err := fc.fwManager.Get(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get worker firewall: %s", err)
+// GetPreferFromCache returns the public access firewall representation from the
+// cache if available, and otherwise retrieves it from the API and updates the
+// cache afterwards.
+func (fm *firewallManager) GetPreferFromCache(ctx context.Context) (fw *godo.Firewall, err error) {
+	if fw, isSet := fm.fwCache.getCachedFirewall(); isSet {
+		return fw, nil
 	}
-	if currentFirewall != nil {
-		if fc.fwManager.fwCache.isEqual(currentFirewall) {
-			return nil
-		}
-	}
-	fc.fwManager.fwCache.updateCache(currentFirewall)
-	klog.Info("issuing firewall reconcile")
-	fc.queue.Add(queueKey)
 
-	return nil
+	return fm.Get(ctx)
 }
 
 // Get returns the current public access firewall representation.
-func (fm *firewallManager) Get(ctx context.Context) (*godo.Firewall, error) {
+// On success, the cache is updated.
+func (fm *firewallManager) Get(ctx context.Context) (fw *godo.Firewall, err error) {
+	defer func() {
+		if err == nil {
+			fm.fwCache.updateCache(fw)
+		}
+	}()
+
 	// check cache and query the API firewall service to get firewall by ID, if it exists. Return it. If not, continue.
-	fw := fm.fwCache.getCachedFirewall()
+	fw, _ = fm.fwCache.getCachedFirewall()
 	if fw != nil {
 		var (
 			resp *godo.Response
@@ -256,7 +270,7 @@ func (fm *firewallManager) Get(ctx context.Context) (*godo.Firewall, error) {
 		return fw.Name == fm.workerFirewallName
 	}
 	klog.Infof("filtering firewall list for firewall name %q", fm.workerFirewallName)
-	fw, err := func() (*godo.Firewall, error) {
+	fw, err = func() (*godo.Firewall, error) {
 		var (
 			code   int
 			method string
@@ -288,156 +302,41 @@ func (fm *firewallManager) Get(ctx context.Context) (*godo.Firewall, error) {
 	return fw, nil
 }
 
-// Set applies the given firewall request configuration to the public access firewall if there is a delta.
-// Specifically Set will reconcile away any changes to the inbound rules, outbound rules, firewall name and/or tags.
-func (fm *firewallManager) Set(ctx context.Context, fr *godo.FirewallRequest) error {
-	targetFirewall := fm.fwCache.getCachedFirewall()
-
-	if targetFirewall != nil {
-		diff := firewallDiff(targetFirewall, fr)
-		if diff == "" {
-			// A locally cached firewall with matching rules, correct name and tags means there is nothing to update.
-			klog.Info("skipping firewall update since it matches the cache")
-			return nil
+// Set applies the given firewall request configuration to the public access
+// firewall to reconcile away any changes to the inbound rules, outbound rules,
+// firewall name, and/or tags. The given firewall ID is non-empty if a firewall
+// already exists.
+// On success, the cache is updated.
+func (fm *firewallManager) Set(ctx context.Context, fwID string, fr *godo.FirewallRequest) (err error) {
+	var currentFirewall *godo.Firewall
+	defer func() {
+		if err == nil {
+			fm.fwCache.updateCache(currentFirewall)
 		}
-		klog.Infof("firewall configuration mismatch on parts (diffs: %s)", diff)
-		// klog.Infof("firewall configuration mismatch on parts (diff:\ncurrent: %s\ntarget:  %s)", printRelevantFirewallRequestParts(fr), printRelevantFirewallParts(targetFirewall))
+	}()
 
-		// A locally cached firewall exists, but is does not match the expected
-		// service inbound rules, outbound rules, name or tags. So we need to use the locally
-		// cached firewall ID to attempt to update the firewall APIs representation of the
-		// firewall with the new rules
-		currentFirewall, resp, err := fm.updateFirewall(ctx, targetFirewall.ID, fr)
+	if fwID != "" {
+		var resp *godo.Response
+		currentFirewall, resp, err = fm.updateFirewall(ctx, fwID, fr)
 		if err == nil {
 			klog.Info("successfully updated firewall")
-		} else {
-			if resp == nil || resp.StatusCode != http.StatusNotFound {
-				return fmt.Errorf("could not update firewall: %v", err)
-			}
-			currentFirewall, err = fm.createFirewall(ctx, fr)
-			if err != nil {
-				return fmt.Errorf("could not create firewall: %v", err)
-			}
-			klog.Info("successfully created firewall")
+			return nil
 		}
-		fm.fwCache.updateCache(currentFirewall)
-		return nil
+		if resp == nil || resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("could not update firewall: %v", err)
+		}
 	}
 
-	// Check if the target firewall ID exists. In the case that CCM first starts up and the
-	// firewall ID does not exist yet, check the API and see if a firewall by the right name
-	// already exists.
-	if targetFirewall == nil {
-		currentFirewall, err := fm.Get(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to check if firewall already exists: %s", err)
-		}
-		if currentFirewall == nil {
-			klog.Info("existing firewall not found, need to create one")
-			currentFirewall, err = fm.createFirewall(ctx, fr)
-			if err != nil {
-				return err
-			}
-			klog.Info("successfully created firewall")
-		} else {
-			klog.Info("existing firewall found, need to update it")
-			currentFirewall, _, err = fm.updateFirewall(ctx, currentFirewall.ID, fr)
-			if err != nil {
-				return fmt.Errorf("could not update firewall: %v", err)
-			}
-			klog.Info("successfully updated firewall")
-		}
-		fm.fwCache.updateCache(currentFirewall)
+	// We either did not have a firewall ID (i.e., the firewall has not been
+	// created yet) or we failed to update the firewall (which could happen if
+	// the firewall was deleted directly). Either way, we need to (re-)create
+	// it.
+	currentFirewall, err = fm.createFirewall(ctx, fr)
+	if err != nil {
+		return fmt.Errorf("could not create firewall: %v", err)
 	}
+	klog.Info("successfully created firewall")
 	return nil
-}
-
-func firewallDiff(targetFirewall *godo.Firewall, fr *godo.FirewallRequest) string {
-	type firewallCompare struct {
-		Name          string
-		InboundRules  []godo.InboundRule
-		OutboundRules []godo.OutboundRule
-		Tags          []string
-	}
-
-	fwComp1 := firewallCompare{
-		Name:          targetFirewall.Name,
-		InboundRules:  targetFirewall.InboundRules,
-		OutboundRules: targetFirewall.OutboundRules,
-		Tags:          targetFirewall.Tags,
-	}
-	fwComp2 := firewallCompare{
-		Name:          fr.Name,
-		InboundRules:  fr.InboundRules,
-		OutboundRules: fr.OutboundRules,
-		Tags:          fr.Tags,
-	}
-
-	sorter := cmpopts.SortSlices(func(r1, r2 godo.OutboundRule) bool {
-		return printOutboundRule(r1) < printOutboundRule(r2)
-	})
-
-	portRangeFilter := cmp.FilterPath(func(p cmp.Path) bool {
-		switch p.String() {
-		case "InboundRules.PortRange", "OutboundRules.PortRange":
-			return true
-		}
-		return false
-	}, cmp.Comparer(func(pr1, pr2 string) bool {
-		if pr1 == "" || pr1 == "0" || pr1 == "all" {
-			pr1 = "0"
-		}
-		if pr2 == "" || pr2 == "0" || pr2 == "all" {
-			pr2 = "0"
-		}
-
-		return pr1 == pr2
-	}))
-
-	ruleDetailsFilter := cmp.FilterPath(func(p cmp.Path) bool {
-		if strings.HasPrefix(p.String(), "InboundRules.Sources") || strings.HasPrefix(p.String(), "OutboundRules.Destinations") {
-			return p.Last().String() != ".Addresses"
-		}
-
-		return false
-	}, cmp.Ignore())
-
-	return cmp.Diff(fwComp1, fwComp2, sorter, portRangeFilter, ruleDetailsFilter)
-}
-
-func isDiff(targetFirewall *godo.Firewall, fr *godo.FirewallRequest) (bool, []string) {
-	var unequalParts []string
-	if targetFirewall.Name != fr.Name {
-		unequalParts = append(unequalParts, "name")
-	}
-	if diff := cmp.Diff(targetFirewall.InboundRules, fr.InboundRules,
-		cmp.Transformer("inboundrule", func(r godo.InboundRule) string {
-			return printInboundRule(r)
-		}),
-		cmpopts.SortSlices(func(r1, r2 string) bool {
-			return r1 < r2
-		}),
-	); diff != "" {
-		unequalParts = append(unequalParts, diff)
-	}
-	if diff := cmp.Diff(targetFirewall.OutboundRules, fr.OutboundRules,
-		cmp.Transformer("outboundrule", func(r godo.OutboundRule) string {
-			transformed := printOutboundRule(r)
-			klog.Infof("=========== transformed outbound rule: %s", transformed)
-			return transformed
-		}),
-		cmpopts.SortSlices(func(r1, r2 string) bool {
-			return r1 < r2
-		}),
-	); diff != "" {
-		unequalParts = append(unequalParts, diff)
-	}
-	if diff := cmp.Diff(targetFirewall.Tags, fr.Tags, cmpopts.SortSlices(func(t1, t2 string) bool {
-		return t1 < t2
-	})); diff != "" {
-		unequalParts = append(unequalParts, diff)
-	}
-	return len(unequalParts) == 0, unequalParts
 }
 
 func (fm *firewallManager) createFirewall(ctx context.Context, fr *godo.FirewallRequest) (*godo.Firewall, error) {
@@ -453,7 +352,6 @@ func (fm *firewallManager) createFirewall(ctx context.Context, fr *godo.Firewall
 	}))
 	defer timer.ObserveDuration()
 
-	klog.Infof("submitting firewall create request: %s", printRelevantFirewallRequestParts(fr))
 	currentFirewall, resp, err := fm.client.Firewalls.Create(ctx, fr)
 	if resp != nil {
 		code = resp.StatusCode
@@ -478,7 +376,6 @@ func (fm *firewallManager) updateFirewall(ctx context.Context, fwID string, fr *
 	}))
 	defer timer.ObserveDuration()
 
-	klog.Infof("submitting firewall update request: %s", printRelevantFirewallRequestParts(fr))
 	currentFirewall, resp, err := fm.client.Firewalls.Update(ctx, fwID, fr)
 	if resp != nil {
 		code = resp.StatusCode
@@ -533,122 +430,89 @@ func (fc *FirewallController) createReconciledFirewallRequest(serviceList []*v1.
 	}
 }
 
-func (fc *FirewallController) ensureReconciledFirewall(ctx context.Context) error {
+func (fc *FirewallController) ensureReconciledFirewall(ctx context.Context) (skipped bool, err error) {
 	serviceList, err := fc.serviceLister.List(labels.Everything())
 	if err != nil {
-		return fmt.Errorf("failed to list services: %v", err)
+		return false, fmt.Errorf("failed to list services: %v", err)
 	}
 	fr := fc.createReconciledFirewallRequest(serviceList)
-	err = fc.fwManager.Set(ctx, fr)
+
+	fw, err := fc.fwManager.GetPreferFromCache(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to set reconciled firewall: %v", err)
+		return false, fmt.Errorf("failed to get firewall (preferred from cache): %v", err)
 	}
+
+	isEqual, diff := firewallRequestEqual(fw, fr)
+	if isEqual {
+		klog.V(5).Info("skipping firewall reconcile because target and cached firewall match")
+		return true, nil
+	}
+
+	var fwID string
+	if fw == nil {
+		klog.Infof("creating firewall: %s", printRelevantFirewallRequestParts(fr))
+	} else {
+		fwID = fw.ID
+		if diff != "" {
+			diff = fmt.Sprintf("\ndiff:\n%s", diff)
+		}
+		klog.Infof("updating firewall\nfrom: %s\nto:   %s%s", printRelevantFirewallParts(fw), printRelevantFirewallRequestParts(fr), diff)
+	}
+
+	err = fc.fwManager.Set(ctx, fwID, fr)
+	if err != nil {
+		return false, fmt.Errorf("failed to set firewall: %v", err)
+	}
+	return false, nil
+}
+
+func (fc *FirewallController) observeReconcileDuration(ctx context.Context) error {
+	labels := prometheus.Labels{
+		"result":     "reconciled",
+		"error_type": "",
+	}
+	t := prometheus.NewTimer(prometheus.ObserverFunc(func(v float64) {
+		fc.fwManager.metrics.reconcileDuration.With(labels).Observe(v)
+	}))
+
+	defer t.ObserveDuration()
+
+	skipped, err := fc.ensureReconciledFirewall(ctx)
+	if err != nil {
+		labels["result"] = "failed"
+		labels["error_type"] = "generic"
+		if ctx.Err() != nil {
+			labels["error_type"] = "timeout"
+		}
+		return err
+	}
+
+	if skipped {
+		labels["result"] = "skipped"
+	}
+
 	return nil
 }
 
-func (fc *firewallCache) getCachedFirewall() *godo.Firewall {
-	fc.mu.RLock()
-	defer fc.mu.RUnlock()
-	return fc.firewall
-}
-
-func (fc *firewallCache) isEqual(fw *godo.Firewall) bool {
-	fc.mu.RLock()
-	defer fc.mu.RUnlock()
-	return cmp.Equal(fc.firewall, fw)
-}
-
-func (fc *firewallCache) updateCache(currentFirewall *godo.Firewall) {
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
-	fc.firewall = currentFirewall
-	klog.Infof("updated cached firewall to: %s", printRelevantFirewallParts(currentFirewall))
-}
-
-func (fc *FirewallController) observeReconcileDuration(ctx context.Context, origin string) error {
-	labels := prometheus.Labels{"reconcile_type": origin}
-	t := prometheus.NewTimer(fc.fwManager.metrics.reconcileDuration.With(labels))
-	defer t.ObserveDuration()
-
-	return fc.ensureReconciledFirewall(ctx)
-}
-
 func (fc *FirewallController) observeRunLoopDuration(ctx context.Context) error {
-	labels := prometheus.Labels{"success": "false"}
+	labels := prometheus.Labels{"result": "updated"}
 	t := prometheus.NewTimer(prometheus.ObserverFunc(func(v float64) {
 		fc.fwManager.metrics.runLoopDuration.With(labels).Observe(v)
 	}))
 	defer t.ObserveDuration()
 
-	err := fc.reconcileCloudFirewallChanges(ctx)
-	if err == nil || ctx.Err() != nil {
-		labels["success"] = "true"
+	// Ignore Get() result since we only care about the cache getting updated.
+	_, err := fc.fwManager.Get(ctx)
+	if err != nil {
+		labels["result"] = "failed"
+		if ctx.Err() != nil {
+			labels["result"] = "aborted"
+		}
+
+		return err
 	}
 
-	return err
-}
-
-func printRelevantFirewallParts(fw *godo.Firewall) string {
-	return printFirewallParts(fw.Name, fw.InboundRules, fw.OutboundRules, fw.Tags)
-}
-
-func printRelevantFirewallRequestParts(fr *godo.FirewallRequest) string {
-	return printFirewallParts(fr.Name, fr.InboundRules, fr.OutboundRules, fr.Tags)
-}
-
-func printFirewallParts(name string, inboundRules []godo.InboundRule, outboundRules []godo.OutboundRule, tags []string) string {
-	parts := []string{fmt.Sprintf("Name:%s", name)}
-	parts = append(parts, fmt.Sprintf("inRules:{%s}", printInboundRules(inboundRules)))
-	parts = append(parts, fmt.Sprintf("outRules:{%s}", printOutboundRules(outboundRules)))
-	parts = append(parts, fmt.Sprintf("Tags:%s", tags))
-
-	return strings.Join(parts, " ")
-}
-
-func printInboundRules(inboundRules []godo.InboundRule) string {
-	inbRules := make([]string, 0, len(inboundRules))
-	for _, inbRule := range inboundRules {
-		inbRules = append(inbRules, printInboundRule(inbRule))
-	}
-	sort.Strings(inbRules)
-	return strings.Join(inbRules, " ")
-}
-
-func printInboundRule(inboundRule godo.InboundRule) string {
-	portRange := inboundRule.PortRange
-	if inboundRule.PortRange == "" || inboundRule.PortRange == "all" {
-		portRange = "0"
-	}
-	rule := fmt.Sprintf("<Proto:%s PortRange:%s", inboundRule.Protocol, portRange)
-
-	if inboundRule.Sources != nil {
-		rule += fmt.Sprintf(" AddrSources:%s", inboundRule.Sources.Addresses)
-	}
-
-	rule += ">"
-	return rule
-}
-
-func printOutboundRules(outboundRules []godo.OutboundRule) string {
-	outbRules := make([]string, 0, len(outboundRules))
-	for _, outbRule := range outboundRules {
-		outbRules = append(outbRules, printOutboundRule(outbRule))
-	}
-	sort.Strings(outbRules)
-	return strings.Join(outbRules, " ")
-}
-
-func printOutboundRule(outboundRule godo.OutboundRule) string {
-	portRange := outboundRule.PortRange
-	if outboundRule.PortRange == "" || outboundRule.PortRange == "all" {
-		portRange = "0"
-	}
-	rule := fmt.Sprintf("<Proto:%s PortRange:%s", outboundRule.Protocol, portRange)
-
-	if outboundRule.Destinations != nil {
-		rule += fmt.Sprintf(" AddrDestinations:%s", outboundRule.Destinations.Addresses)
-	}
-
-	rule += ">"
-	return rule
+	klog.V(5).Info("issuing firewall reconcile")
+	fc.queue.Add(queueKey)
+	return nil
 }
